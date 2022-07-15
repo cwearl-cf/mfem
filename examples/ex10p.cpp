@@ -402,10 +402,10 @@ int main(int argc, char *argv[])
    
    double ee0 = oper.ElasticEnergy(x_gf);
    double ke0 = oper.KineticEnergy(v_gf);
-   NonlinearForm H(fespace);
-   std::cout << "rw: " << myid << " " << H.Width() << "==" << x_gf.Size() << " / " << v_gf.Size() << std::endl;
-   const int le = H.GetEnergy(x_gf);
-   std::cout << "rr: " << myid << " " << le << std::endl;
+   //NonlinearForm H(fespace);
+   //std::cout << "rw: " << myid << " " << H.Width() << "==" << x_gf.Size() << " / " << v_gf.Size() << std::endl;
+   //const int le = H.GetEnergy(x_gf);
+   //std::cout << "rr: " << myid << " " << le << std::endl;
    if (myid == 0)
    {
       cout << "initial elastic energy (EE) = " << ee0 << endl;
