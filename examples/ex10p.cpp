@@ -43,6 +43,99 @@
 using namespace std;
 using namespace mfem;
 
+void test_solution(ParGridFunction const & x, double const * const expected_values ) {
+	int myid = Mpi::WorldRank();
+	auto end = x.end();
+	int i = 0;
+	std::cout << "output: " << myid << " [ ";
+	for( auto iter = x.begin(); iter != end; iter++, i++ ) {
+        std::cout << *iter << ", ";
+		if( std::abs( *iter - expected_values[i] ) > 1e-5 )
+            std::cout << "In Rank " << myid << ": Difference in solution from expectation. Position: " << i << " acutal value: " << *iter << " expected value: " << expected_values[i] << std::endl;
+		assert( std::abs( *iter - expected_values[i] ) < 1e-5 );
+	}
+	std::cout << "]";
+	std::cout << std::endl;
+};
+
+void set_grev_pts( const mfem::KnotVector & kv, const int numIntervals, const int p, const double scaling, mfem::Array< double > & grev_pts )
+{
+	for( int i = 1; i < kv.Size() - p; i++ ) {
+		double sum = 0.0;
+		for ( int k = 0; k < p; k ++ ) {
+			sum += kv[ i + k ];
+		}
+		grev_pts.Append( ( sum / ( p * numIntervals ) ) * scaling );
+	}
+};
+
+mfem::Mesh build_mesh( const int poly_degree, const int x, const int y, int cont = -1, const double x_scaling = 1.0, const double y_scaling = 1.0 )
+{
+	using namespace mfem;
+
+	if( cont == -1 )
+		cont = poly_degree - 1;
+
+	Array< double > x_intervals;
+	Array< double > y_intervals;
+	Array< int > x_continuity;
+	Array< int > y_continuity;
+
+	x_intervals.Append( 1 );
+	x_continuity.Append( -1 );
+
+	for( int i = 0; i < x - 1; i++ ) {
+		x_intervals.Append( 1 );
+		x_continuity.Append( cont );
+	}
+	x_continuity.Append( -1 );
+
+	y_intervals.Append( 1 );
+	y_continuity.Append( -1 );
+
+	for( int i = 0; i < y - 1; i++ ) {
+		y_intervals.Append( 1 );
+		y_continuity.Append( cont );
+	}
+	y_continuity.Append( -1 );
+
+	const KnotVector xkv( poly_degree, x_intervals, x_continuity );
+	const KnotVector ykv( poly_degree, y_intervals, y_continuity );
+	Array< NURBSPatch* > patches;
+
+	Array< double > x_grev_pts;
+	set_grev_pts( xkv, x, poly_degree, x_scaling, x_grev_pts );
+	Array< double > y_grev_pts;
+	set_grev_pts( ykv, y, poly_degree, y_scaling, y_grev_pts );
+
+	Array< double > pts( 3 * xkv.GetNCP() * ykv.GetNCP() );
+	int count = 0;
+	for( int j = 0; j < ykv.GetNCP(); ++j )
+		for( int i = 0; i < xkv.GetNCP(); ++i ) {
+			pts[ count + 0 ] = x_grev_pts[ i ];
+			pts[ count + 1 ] = y_grev_pts[ j ];
+			pts[ count + 2 ] = 1;
+			count += 3;
+		}
+	patches.Append( new NURBSPatch( &xkv, &ykv, 3, pts.GetData() ) );
+	patches[ 0 ]->Print(std::cout);
+	Mesh patch_topology = Mesh::MakeCartesian2D( 1, 1, Element::Type::QUADRILATERAL);
+	NURBSExtension ne( &patch_topology, patches );
+	return Mesh( ne );
+};
+
+void set_p_and_r( const int size, SparseMatrix & p, SparseMatrix & r )
+{
+	for( size_t i = 0; i < size; ++i )
+	{
+		p.Add( i, i, 1 );
+		r.Add( i, i, 1 );
+	}
+	p.Finalize();
+	r.Finalize();
+};
+
+
 class ReducedSystemOperator;
 
 /** After spatial discretization, the hyperelastic model can be written as a
@@ -168,73 +261,22 @@ int main(int argc, char *argv[])
    Hypre::Init();
 
    // 2. Parse command-line options.
-   const char *mesh_file = "../data/beam-quad.mesh";
-   int ser_ref_levels = 2;
-   int par_ref_levels = 0;
    int order = 2;
    int ode_solver_type = 3;
-   double t_final = 300.0;
+   double t_final = 60.0;
    double dt = 3.0;
    double visc = 1e-2;
    double mu = 0.25;
    double K = 5.0;
-   bool adaptive_lin_rtol = true;
    bool visualization = true;
    int vis_steps = 1;
-
-   OptionsParser args(argc, argv);
-   args.AddOption(&mesh_file, "-m", "--mesh",
-                  "Mesh file to use.");
-   args.AddOption(&ser_ref_levels, "-rs", "--refine-serial",
-                  "Number of times to refine the mesh uniformly in serial.");
-   args.AddOption(&par_ref_levels, "-rp", "--refine-parallel",
-                  "Number of times to refine the mesh uniformly in parallel.");
-   args.AddOption(&order, "-o", "--order",
-                  "Order (degree) of the finite elements.");
-   args.AddOption(&ode_solver_type, "-s", "--ode-solver",
-                  "ODE solver: 1 - Backward Euler, 2 - SDIRK2, 3 - SDIRK3,\n\t"
-                  "            11 - Forward Euler, 12 - RK2,\n\t"
-                  "            13 - RK3 SSP, 14 - RK4."
-                  "            22 - Implicit Midpoint Method,\n\t"
-                  "            23 - SDIRK23 (A-stable), 24 - SDIRK34");
-   args.AddOption(&t_final, "-tf", "--t-final",
-                  "Final time; start time is 0.");
-   args.AddOption(&dt, "-dt", "--time-step",
-                  "Time step.");
-   args.AddOption(&visc, "-v", "--viscosity",
-                  "Viscosity coefficient.");
-   args.AddOption(&mu, "-mu", "--shear-modulus",
-                  "Shear modulus in the Neo-Hookean hyperelastic model.");
-   args.AddOption(&K, "-K", "--bulk-modulus",
-                  "Bulk modulus in the Neo-Hookean hyperelastic model.");
-   args.AddOption(&adaptive_lin_rtol, "-alrtol", "--adaptive-lin-rtol",
-                  "-no-alrtol", "--no-adaptive-lin-rtol",
-                  "Enable or disable adaptive linear solver rtol.");
-   args.AddOption(&visualization, "-vis", "--visualization", "-no-vis",
-                  "--no-visualization",
-                  "Enable or disable GLVis visualization.");
-   args.AddOption(&vis_steps, "-vs", "--visualization-steps",
-                  "Visualize every n-th timestep.");
-   args.Parse();
-   if (!args.Good())
-   {
-      if (myid == 0)
-      {
-         args.PrintUsage(cout);
-      }
-      return 1;
-   }
-   if (myid == 0)
-   {
-      args.PrintOptions(cout);
-   }
-
+   
    // 3. Read the serial mesh from the given mesh file on all processors. We can
    //    handle triangular, quadrilateral, tetrahedral and hexahedral meshes
    //    with the same code.
-   Mesh *mesh = new Mesh(mesh_file, 1, 1);
-   int dim = mesh->Dimension();
-
+   Mesh mesh = build_mesh( 2, 8, 1, 1, 8.0, 1.0 );
+   int dim = mesh.Dimension();
+   
    // 4. Define the ODE solver used for time integration. Several implicit
    //    singly diagonal implicit Runge-Kutta (SDIRK) methods, as well as
    //    explicit Runge-Kutta methods are available.
@@ -256,83 +298,83 @@ int main(int argc, char *argv[])
       case 23: ode_solver = new SDIRK23Solver; break;
       case 24: ode_solver = new SDIRK34Solver; break;
       default:
-         if (myid == 0)
-         {
-            cout << "Unknown ODE solver type: " << ode_solver_type << '\n';
-         }
-         delete mesh;
-         return 3;
+         ode_solver = new SDIRK33Solver;
    }
-
-   // 5. Refine the mesh in serial to increase the resolution. In this example
-   //    we do 'ser_ref_levels' of uniform refinement, where 'ser_ref_levels' is
-   //    a command-line parameter.
-   for (int lev = 0; lev < ser_ref_levels; lev++)
-   {
-      mesh->UniformRefinement();
-   }
-
+   
    // 6. Define a parallel mesh by a partitioning of the serial mesh. Refine
    //    this mesh further in parallel to increase the resolution. Once the
    //    parallel mesh is defined, the serial mesh can be deleted.
-   ParMesh *pmesh = new ParMesh(MPI_COMM_WORLD, *mesh);
-   delete mesh;
-   for (int lev = 0; lev < par_ref_levels; lev++)
-   {
-      pmesh->UniformRefinement();
-   }
-
+   ParMesh *pmesh = new ParMesh(MPI_COMM_WORLD, mesh);
+   
    // 7. Define the parallel vector finite element spaces representing the mesh
    //    deformation x_gf, the velocity v_gf, and the initial configuration,
    //    x_ref. Define also the elastic energy density, w_gf, which is in a
    //    discontinuous higher-order space. Since x and v are integrated in time
    //    as a system, we group them together in block vector vx, on the unique
    //    parallel degrees of freedom, with offsets given by array true_offset.
-   H1_FECollection fe_coll(order, dim);
-   ParFiniteElementSpace fespace(pmesh, &fe_coll, dim);
-
-   HYPRE_BigInt glob_size = fespace.GlobalTrueVSize();
+   ParFiniteElementSpace * fespace = (ParFiniteElementSpace*)pmesh->GetNodes()->FESpace();
+   
+   SparseMatrix p( fespace->GetVSize(), fespace->GetVSize() );
+   SparseMatrix r( fespace->GetVSize(), fespace->GetVSize() );
+   set_p_and_r( fespace->GetVSize(), p, r );
+   
+   HYPRE_BigInt glob_size = fespace->GlobalTrueVSize();
    if (myid == 0)
    {
       cout << "Number of velocity/deformation unknowns: " << glob_size << endl;
    }
-   int true_size = fespace.TrueVSize();
+   int true_size = fespace->GetTrueVSize();
+   int full_size = fespace->GetVSize();
+   std::cout << "rs: " << myid << " " << true_size << " " << full_size << std::endl;
    Array<int> true_offset(3);
    true_offset[0] = 0;
    true_offset[1] = true_size;
    true_offset[2] = 2*true_size;
-
+   
    BlockVector vx(true_offset);
    ParGridFunction v_gf, x_gf;
-   v_gf.MakeTRef(&fespace, vx, true_offset[0]);
-   x_gf.MakeTRef(&fespace, vx, true_offset[1]);
-
-   ParGridFunction x_ref(&fespace);
+   v_gf.MakeTRef(fespace, vx, true_offset[0]);
+   x_gf.MakeTRef(fespace, vx, true_offset[1]);
+   
+   ParGridFunction x_ref(fespace);
    pmesh->GetNodes(x_ref);
-
+   
    L2_FECollection w_fec(order + 1, dim);
    ParFiniteElementSpace w_fespace(pmesh, &w_fec);
    ParGridFunction w_gf(&w_fespace);
-
+   
    // 8. Set the initial conditions for v_gf, x_gf and vx, and define the
    //    boundary conditions on a beam-like mesh (see description above).
-   VectorFunctionCoefficient velo(dim, InitialVelocity);
-   v_gf.ProjectCoefficient(velo);
-   v_gf.SetTrueVector();
-   VectorFunctionCoefficient deform(dim, InitialDeformation);
-   x_gf.ProjectCoefficient(deform);
-   x_gf.SetTrueVector();
-
+   //    TODO: fix indexing, currently local and global indexing are expected to be the same but in this test they are different
+   Vector control_points;
+   x_ref.GetTrueDofs( control_points );
+   const int num_points = control_points.Size() / 2;
+   std::cout << "My rank: " << myid << " num_points: " << num_points << std::endl;
+   for(int i = 0; i < num_points; i++) {
+   	int lx = i*2, ly = i*2+1;
+   	double temp1[3], temp2[3];
+   	Vector point( temp1, 2 );
+   	Vector deform( temp2, 2 );
+   	point[0] = control_points[lx];
+   	point[1] = control_points[ly];
+   	v_gf[lx] = 0;
+   	v_gf[ly] = point[0] / 80.0;
+   	InitialDeformation( point, deform );
+   	x_gf[lx] = deform[0];
+   	x_gf[ly] = deform[1];
+   	std::cout << "R: " << myid << " " << i << " [" << point[0] << "," << point[1] << "] (" << deform[0] << "," << deform[1] << ") <" << 0.0 << "," << point[0] / 80.0 << ">" << std::endl;
+   }
+   
    v_gf.SetFromTrueVector(); x_gf.SetFromTrueVector();
-
-   Array<int> ess_bdr(fespace.GetMesh()->bdr_attributes.Max());
+   
+   Array<int> ess_bdr(fespace->GetMesh()->bdr_attributes.Max());
    ess_bdr = 0;
-   ess_bdr[0] = 1; // boundary attribute 1 (index 0) is fixed
-
+   ess_bdr[3] = 1; // boundary attribute 4 (index 3) is fixed
+   
    // 9. Initialize the hyperelastic operator, the GLVis visualization and print
    //    the initial energies.
-   HyperelasticOperator oper(fespace, ess_bdr, visc, mu, K);
-
+   HyperelasticOperator oper(*fespace, ess_bdr, visc, mu, K);
+   
    socketstream vis_v, vis_w;
    if (visualization)
    {
@@ -357,44 +399,48 @@ int main(int argc, char *argv[])
               << " Press space (in the GLVis window) to resume it.\n";
       }
    }
-
+   
    double ee0 = oper.ElasticEnergy(x_gf);
    double ke0 = oper.KineticEnergy(v_gf);
+   NonlinearForm H(fespace);
+   std::cout << "rw: " << myid << " " << H.Width() << "==" << x_gf.Size() << " / " << v_gf.Size() << std::endl;
+   const int le = H.GetEnergy(x_gf);
+   std::cout << "rr: " << myid << " " << le << std::endl;
    if (myid == 0)
    {
       cout << "initial elastic energy (EE) = " << ee0 << endl;
       cout << "initial kinetic energy (KE) = " << ke0 << endl;
       cout << "initial   total energy (TE) = " << (ee0 + ke0) << endl;
    }
-
+   
    double t = 0.0;
    oper.SetTime(t);
    ode_solver->Init(oper);
-
+   
    // 10. Perform time-integration
    //     (looping over the time iterations, ti, with a time-step dt).
    bool last_step = false;
    for (int ti = 1; !last_step; ti++)
    {
       double dt_real = min(dt, t_final - t);
-
+   
       ode_solver->Step(vx, t, dt_real);
-
+   
       last_step = (t >= t_final - 1e-8*dt);
-
+   
       if (last_step || (ti % vis_steps) == 0)
       {
          v_gf.SetFromTrueVector(); x_gf.SetFromTrueVector();
-
+   
          double ee = oper.ElasticEnergy(x_gf);
          double ke = oper.KineticEnergy(v_gf);
-
+   
          if (myid == 0)
          {
             cout << "step " << ti << ", t = " << t << ", EE = " << ee
                  << ", KE = " << ke << ", ΔTE = " << (ee+ke)-(ee0+ke0) << endl;
          }
-
+   
          if (visualization)
          {
             visualize(vis_v, pmesh, &x_gf, &v_gf);
@@ -406,37 +452,36 @@ int main(int argc, char *argv[])
          }
       }
    }
-
+   
    // 11. Save the displaced mesh, the velocity and elastic energy.
    {
       v_gf.SetFromTrueVector(); x_gf.SetFromTrueVector();
-      GridFunction *nodes = &x_gf;
-      int owns_nodes = 0;
-      pmesh->SwapNodes(nodes, owns_nodes);
-
-      ostringstream mesh_name, velo_name, ee_name;
-      mesh_name << "deformed." << setfill('0') << setw(6) << myid;
-      velo_name << "velocity." << setfill('0') << setw(6) << myid;
-      ee_name << "elastic_energy." << setfill('0') << setw(6) << myid;
-
-      ofstream mesh_ofs(mesh_name.str().c_str());
-      mesh_ofs.precision(8);
-      pmesh->Print(mesh_ofs);
-      pmesh->SwapNodes(nodes, owns_nodes);
-      ofstream velo_ofs(velo_name.str().c_str());
-      velo_ofs.precision(8);
-      v_gf.Save(velo_ofs);
-      ofstream ee_ofs(ee_name.str().c_str());
-      ee_ofs.precision(8);
-      oper.GetElasticEnergyDensity(x_gf, w_gf);
-      w_gf.Save(ee_ofs);
+      // Note: uncomment out the lines below to save the results of this test
+      //GridFunction *nodes = &x_gf;
+      //int owns_nodes = 0;
+      //pmesh->SwapNodes(nodes, owns_nodes);
+   
+      //ostringstream mesh_name, velo_name, ee_name;
+      //mesh_name << "deformed." << setfill('0') << setw(6) << myid;
+      //velo_name << "velocity." << setfill('0') << setw(6) << myid;
+      //ee_name << "elastic_energy." << setfill('0') << setw(6) << myid;
+   
+      //ofstream mesh_ofs(mesh_name.str().c_str());
+      //mesh_ofs.precision(8);
+      //pmesh->Print(mesh_ofs);
+      //pmesh->SwapNodes(nodes, owns_nodes);
+      //ofstream velo_ofs(velo_name.str().c_str());
+      //velo_ofs.precision(8);
+      //v_gf.Save(velo_ofs);
+      //ofstream ee_ofs(ee_name.str().c_str());
+      //ee_ofs.precision(8);
+      //oper.GetElasticEnergyDensity(x_gf, w_gf);
+      //w_gf.Save(ee_ofs);
    }
-
+   
    // 12. Free the used memory.
    delete ode_solver;
-   delete pmesh;
-
-   return 0;
+   delete pmesh;return 0;
 }
 
 void visualize(ostream &os, ParMesh *mesh,
